@@ -4,7 +4,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Precisa ser false: o Microsoft.Data.SqlClient resolve CultureInfo ao abrir
+         a conexao e em modo invariant-globalization estoura CultureNotFoundException,
+         derrubando com 500 toda chamada que toca o banco. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
