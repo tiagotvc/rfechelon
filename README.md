@@ -11,10 +11,16 @@ totalmente separado, mesmo criptografia (Argon2id + HMAC-SHA256, copiada
 de `AccountServer/Security/CryptoHelper.cs`) pra ficar compatível com o
 que já está gravado no banco.
 
-## Por que só duas rotas
+## Rotas
 
 - `POST /v1/accounts` — cria uma conta nova em `tbl_rfaccount`.
 - `POST /v1/accounts/login` — verifica usuário/senha.
+- `GET /v1/status` — status real do servidor (online/offline + jogadores
+  conectados agora), lendo o mesmo mod side-channel que o launcher já usa
+  (`WorldServer`, porta 27601 por padrão — ver `WorldServerStatusClient.cs`).
+  Não expõe raça líder nem nada além disso — o side-channel só conta
+  jogadores ativos, não por raça; adicionar isso exigiria mexer no C++ do
+  WorldServer, fora de escopo deste bridge.
 
 Isso é o suficiente pro fluxo "criar conta no site → logar no site →
 logar no client do jogo com a mesma credencial". Não expõe nem cria nada
@@ -39,6 +45,10 @@ que o client nunca consegue usar.
 
 Sem qualquer uma dessas três, o processo recusa subir (falha rápido e
 explícito, não silenciosamente).
+
+Opcionais (têm valor padrão, só mudar se o WorldServer estiver em outra
+máquina da mesma rede): `WORLDSERVER_STATUS_HOST` (padrão `127.0.0.1`),
+`WORLDSERVER_STATUS_PORT` (padrão `27601`).
 
 ## Rodar localmente (teste)
 

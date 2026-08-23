@@ -33,6 +33,10 @@ var builder = WebApplication.CreateBuilder(args);
 var databaseUrl = RequireEnv("DATABASE_URL");
 var argon2SaltBase64 = RequireEnv("ARGON2_SALT_BASE64");
 var bridgeApiKey = RequireEnv("BRIDGE_API_KEY");
+// Onde o mod side-channel do WorldServer escuta — por padrão localhost, já que este bridge roda
+// na mesma VPS. Só precisa mudar se o WorldServer estiver em outra máquina da mesma rede.
+var worldServerHost = Environment.GetEnvironmentVariable("WORLDSERVER_STATUS_HOST") ?? "127.0.0.1";
+var worldServerPort = int.TryParse(Environment.GetEnvironmentVariable("WORLDSERVER_STATUS_PORT"), out var parsedPort) ? parsedPort : 27601;
 
 var hmacKey = Convert.FromBase64String(argon2SaltBase64);
 var argon2Salt = hmacKey; // mesmo valor, mesma logica do AccountServer (AccountDatabaseEf._hmacKey)
@@ -119,6 +123,12 @@ v1.MapPost("/accounts/login", async (AccountRequest request, BridgeDbContext db)
 
     return Results.Ok(new { ok = true, username = request.Username });
 }).RequireRateLimiting("auth");
+
+v1.MapGet("/status", async () =>
+{
+    var status = await WorldServerStatusClient.GetStatusAsync(worldServerHost, worldServerPort, TimeSpan.FromSeconds(4));
+    return Results.Ok(new { online = status.Online, playersOnline = status.PlayersOnline });
+});
 
 app.Run();
 
