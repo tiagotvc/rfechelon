@@ -21,6 +21,11 @@ using Microsoft.EntityFrameworkCore;
 //                        AccountServer calcularia (e vice-versa).
 //   BRIDGE_API_KEY       segredo compartilhado com o site; toda chamada
 //                        precisa do header X-Bridge-Key com esse valor.
+//   WORLD_DATABASE_URL   connection string do SQL Server de personagens
+//                        (RF_World) — mesma instancia/credencial do
+//                        DATABASE_URL acima, so trocando o banco (Database=)
+//                        na maioria dos setups. Usada por GET /v1/characters
+//                        (le tbl_base, nunca escreve nada la).
 //
 // Limite de 12 caracteres em usuario/senha: vem do proprio protocolo do
 // cliente do jogo (ver AccountServer/Server/LoginHandler.cs,
@@ -31,6 +36,7 @@ using Microsoft.EntityFrameworkCore;
 var builder = WebApplication.CreateBuilder(args);
 
 var databaseUrl = RequireEnv("DATABASE_URL");
+var worldDatabaseUrl = RequireEnv("WORLD_DATABASE_URL");
 var argon2SaltBase64 = RequireEnv("ARGON2_SALT_BASE64");
 var bridgeApiKey = RequireEnv("BRIDGE_API_KEY");
 // Onde o mod side-channel do WorldServer escuta — por padrão localhost, já que este bridge roda
@@ -43,6 +49,8 @@ var argon2Salt = hmacKey; // mesmo valor, mesma logica do AccountServer (Account
 
 builder.Services.AddDbContext<BridgeDbContext>(options =>
     options.UseSqlServer(databaseUrl));
+builder.Services.AddDbContext<WorldDbContext>(options =>
+    options.UseSqlServer(worldDatabaseUrl));
 
 builder.Services.AddRateLimiter(options =>
 {
@@ -130,6 +138,26 @@ v1.MapGet("/status", async () =>
     return Results.Ok(new { online = status.Online, playersOnline = status.PlayersOnline });
 });
 
+// Lista os personagens de uma conta (tbl_base.Account = usuario em texto
+// puro, o mesmo digitado no login — nao precisa reverter o HMAC de
+// tbl_rfaccount). So leitura, nunca escreve em tbl_base.
+v1.MapGet("/characters", async (string? username, WorldDbContext world) =>
+{
+    if (!IsValidUsername(username, out var error))
+    {
+        return Results.BadRequest(new { error });
+    }
+
+    var characters = await world.Characters
+        .AsNoTracking()
+        .Where(c => c.Account == username)
+        .OrderBy(c => c.Slot)
+        .Select(c => new { serial = c.Serial, name = c.Name, level = c.Lv, race = c.Race })
+        .ToListAsync();
+
+    return Results.Ok(characters);
+}).RequireRateLimiting("auth");
+
 app.Run();
 
 static string RequireEnv(string name)
@@ -177,6 +205,17 @@ static bool IsAscii(string value)
     return true;
 }
 
+static bool IsValidUsername(string? username, out string error)
+{
+    if (string.IsNullOrWhiteSpace(username) || username.Length < 4 || username.Length > 12 || !IsAscii(username))
+    {
+        error = "Usuário deve ter de 4 a 12 caracteres (letras e números, sem espaço ou acento).";
+        return false;
+    }
+    error = "";
+    return true;
+}
+
 public sealed record AccountRequest(string Username, string Password);
 
 public sealed class AccountAuth
@@ -203,6 +242,39 @@ public sealed class BridgeDbContext(DbContextOptions<BridgeDbContext> options) :
             entity.Property(e => e.PasswordHash).HasColumnName("password_hash").HasMaxLength(255);
             entity.Property(e => e.AccountType).HasColumnName("accounttype");
             entity.Property(e => e.BirthDate).HasColumnName("birthdate");
+        });
+    }
+}
+
+// Personagem (avatar) — tbl_base no banco RF_World. Só os campos que a
+// loja de doações precisa pra deixar o jogador escolher o personagem;
+// nunca escreve nada nessa tabela (inventário/entrega é tarefa da Fase 2).
+public sealed class CharacterRow
+{
+    public int Serial { get; set; }
+    public string Name { get; set; } = "";
+    public string Account { get; set; } = "";
+    public int Slot { get; set; }
+    public int Race { get; set; }
+    public int Lv { get; set; }
+}
+
+public sealed class WorldDbContext(DbContextOptions<WorldDbContext> options) : DbContext(options)
+{
+    public DbSet<CharacterRow> Characters => Set<CharacterRow>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<CharacterRow>(entity =>
+        {
+            entity.ToTable("tbl_base", "dbo");
+            entity.HasKey(e => e.Serial);
+            entity.Property(e => e.Serial).HasColumnName("Serial");
+            entity.Property(e => e.Name).HasColumnName("Name").HasMaxLength(17);
+            entity.Property(e => e.Account).HasColumnName("Account").HasMaxLength(17);
+            entity.Property(e => e.Slot).HasColumnName("Slot");
+            entity.Property(e => e.Race).HasColumnName("Race");
+            entity.Property(e => e.Lv).HasColumnName("Lv");
         });
     }
 }
