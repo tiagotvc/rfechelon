@@ -23,10 +23,15 @@ que já está gravado no banco.
   WorldServer, fora de escopo deste bridge.
 - `GET /v1/characters?username=X` — lista os personagens de uma conta
   (`tbl_base` no banco `RF_World`: serial, nome, level, raça). Só leitura,
-  nunca escreve em `tbl_base`. Usado pela loja de doações do site pra
-  escolher em qual personagem uma compra deve cair — a entrega em si
-  (item cair na bag/e-mail) não é feita por aqui, é trabalho futuro no
-  WorldServer (fora de escopo deste bridge).
+  nunca escreve em `tbl_base`.
+- `POST /v1/deliver` — entrega de verdade (Fase 2 da loja de doações):
+  `{characterSerial, itemCode, amount}`, repassa pro canal novo do
+  WorldServer (`CStoreDeliveryChannel`, porta 27602 por padrão — ver
+  `StoreDeliveryClient.cs`), que cai na bag do personagem se ele estiver
+  online com espaço, ou por correio in-game caso contrário. Devolve
+  `{ok:true, status:"bag"|"mail"}` ou `{ok:false, status:"not_found"|"error"}`
+  — nunca lança erro de conexão pra fora, quem chama decide se tenta de
+  novo (o site já faz isso via fila `deliveries` + retry).
 
 Isso é o suficiente pro fluxo "criar conta no site → logar no site →
 logar no client do jogo com a mesma credencial". Não expõe nem cria nada
@@ -49,13 +54,16 @@ que o client nunca consegue usar.
 | `WORLD_DATABASE_URL` | Connection string do SQL Server do banco `RF_World` (personagens, `tbl_base`) — mesma instância/credencial do `DATABASE_URL` na maioria dos setups, só trocando `Database=`. Usada só por `GET /v1/characters`. |
 | `ARGON2_SALT_BASE64` | **O MESMO valor** configurado no AccountServer (Settings → Security → Argon2 Salt). Usado como salt do Argon2id e pra derivar a chave HMAC/AES-GCM — sem bater esse valor, senha criada aqui nunca verifica certo no AccountServer (e vice-versa). |
 | `BRIDGE_API_KEY` | Segredo compartilhado com o site. Toda chamada em `/v1/*` precisa do header `X-Bridge-Key` com esse valor — gere algo forte, ex. `openssl rand -base64 32`. |
+| `WORLDSERVER_DELIVERY_SECRET` | Segredo compartilhado com o `CStoreDeliveryChannel` do WorldServer (porta 27602) — mandado dentro de CADA pedido de `/v1/deliver`, já que esse canal concede item (diferente do canal de status, que é só leitura e sem auth). Gere com `openssl rand -base64 32`, igual o `BRIDGE_API_KEY`. |
 
-Sem qualquer uma dessas quatro, o processo recusa subir (falha rápido e
+Sem qualquer uma dessas cinco, o processo recusa subir (falha rápido e
 explícito, não silenciosamente).
 
 Opcionais (têm valor padrão, só mudar se o WorldServer estiver em outra
 máquina da mesma rede): `WORLDSERVER_STATUS_HOST` (padrão `127.0.0.1`),
-`WORLDSERVER_STATUS_PORT` (padrão `27601`).
+`WORLDSERVER_STATUS_PORT` (padrão `27601`), `WORLDSERVER_DELIVERY_HOST`
+(padrão = mesmo valor de `WORLDSERVER_STATUS_HOST`),
+`WORLDSERVER_DELIVERY_PORT` (padrão `27602`).
 
 ## Rodar localmente (teste)
 
@@ -65,6 +73,7 @@ DATABASE_URL="Server=...;Database=RF_User;User Id=...;Password=...;TrustServerCe
 WORLD_DATABASE_URL="Server=...;Database=RF_World;User Id=...;Password=...;TrustServerCertificate=True" \
 ARGON2_SALT_BASE64="<mesmo valor do AccountServer>" \
 BRIDGE_API_KEY="uma-chave-de-teste" \
+WORLDSERVER_DELIVERY_SECRET="outra-chave-de-teste" \
 dotnet run
 ```
 

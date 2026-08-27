@@ -43,6 +43,11 @@ var bridgeApiKey = RequireEnv("BRIDGE_API_KEY");
 // na mesma VPS. Só precisa mudar se o WorldServer estiver em outra máquina da mesma rede.
 var worldServerHost = Environment.GetEnvironmentVariable("WORLDSERVER_STATUS_HOST") ?? "127.0.0.1";
 var worldServerPort = int.TryParse(Environment.GetEnvironmentVariable("WORLDSERVER_STATUS_PORT"), out var parsedPort) ? parsedPort : 27601;
+// Canal separado (Fase 2 da loja de doações) que CONCEDE ITEM — porta e segredo
+// próprios, distintos do canal de status acima (que é só leitura, sem auth).
+var deliveryHost = Environment.GetEnvironmentVariable("WORLDSERVER_DELIVERY_HOST") ?? worldServerHost;
+var deliveryPort = int.TryParse(Environment.GetEnvironmentVariable("WORLDSERVER_DELIVERY_PORT"), out var parsedDeliveryPort) ? parsedDeliveryPort : 27602;
+var deliverySecret = RequireEnv("WORLDSERVER_DELIVERY_SECRET");
 
 var hmacKey = Convert.FromBase64String(argon2SaltBase64);
 var argon2Salt = hmacKey; // mesmo valor, mesma logica do AccountServer (AccountDatabaseEf._hmacKey)
@@ -158,6 +163,35 @@ v1.MapGet("/characters", async (string? username, WorldDbContext world) =>
     return Results.Ok(characters);
 }).RequireRateLimiting("auth");
 
+// Entrega de verdade no personagem (Fase 2 da loja de doações) — repassa
+// pro canal novo do WorldServer (CStoreDeliveryChannel, StoreDeliveryClient.cs).
+// Nunca lança pra fora um erro de conexão: devolve {ok:false} pro site
+// decidir se tenta de novo depois (fila `deliveries`, status='queued').
+v1.MapPost("/deliver", async (DeliverRequest request) =>
+{
+    if (request.CharacterSerial == 0 || string.IsNullOrWhiteSpace(request.ItemCode) || request.Amount == 0)
+    {
+        return Results.BadRequest(new { error = "characterSerial, itemCode e amount são obrigatórios." });
+    }
+
+    var result = await StoreDeliveryClient.DeliverAsync(
+        deliveryHost,
+        deliveryPort,
+        deliverySecret,
+        request.CharacterSerial,
+        request.ItemCode,
+        request.Amount,
+        TimeSpan.FromSeconds(8));
+
+    if (!result.Ok)
+    {
+        var status = result.Status == StoreDeliveryClient.DeliveryStatus.NotFound ? "not_found" : "error";
+        return Results.Ok(new { ok = false, status });
+    }
+
+    return Results.Ok(new { ok = true, status = result.Status == StoreDeliveryClient.DeliveryStatus.Bag ? "bag" : "mail" });
+}).RequireRateLimiting("auth");
+
 app.Run();
 
 static string RequireEnv(string name)
@@ -217,6 +251,8 @@ static bool IsValidUsername(string? username, out string error)
 }
 
 public sealed record AccountRequest(string Username, string Password);
+
+public sealed record DeliverRequest(uint CharacterSerial, string ItemCode, uint Amount);
 
 public sealed class AccountAuth
 {
