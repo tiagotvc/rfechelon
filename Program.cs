@@ -192,6 +192,53 @@ v1.MapPost("/deliver", async (DeliverRequest request) =>
     return Results.Ok(new { ok = true, status = result.Status == StoreDeliveryClient.DeliveryStatus.Bag ? "bag" : "mail" });
 }).RequireRateLimiting("auth");
 
+// Entrega de pacote completo (Fase 3 — vários itens + Cash real numa call só). accountUsername é a
+// conta já autenticada no site (a bridge não descobre dono do personagem, o site já sabe). Mesma
+// regra de nunca lançar erro de conexão pra fora — {ok:false} pro site decidir se tenta de novo.
+v1.MapPost("/deliver-package", async (DeliverPackageRequest request) =>
+{
+    if (request.CharacterSerial == 0 || !IsValidUsername(request.AccountUsername, out var usernameError)
+        || request.Items is null || request.Items.Count == 0 || request.Items.Count > 255)
+    {
+        return Results.BadRequest(new { error = "characterSerial, accountUsername válido e ao menos 1 item são obrigatórios." });
+    }
+    if (request.Items.Any(i => string.IsNullOrWhiteSpace(i.ItemCode) || i.Amount == 0))
+    {
+        return Results.BadRequest(new { error = "Todo item precisa de itemCode e amount > 0." });
+    }
+
+    var items = request.Items
+        .Select(i => new StoreDeliveryClient.PackageItem(i.ItemCode, i.Amount))
+        .ToList();
+
+    var result = await StoreDeliveryClient.DeliverPackageAsync(
+        deliveryHost,
+        deliveryPort,
+        deliverySecret,
+        request.CharacterSerial,
+        request.AccountUsername,
+        request.CashAmount,
+        items,
+        TimeSpan.FromSeconds(8));
+
+    var cashStatus = result.CashStatus switch
+    {
+        StoreDeliveryClient.CashCreditStatus.Credited => "credited",
+        StoreDeliveryClient.CashCreditStatus.Skipped => "skipped",
+        _ => "error",
+    };
+    var itemStatuses = result.ItemStatuses
+        .Select(st => st switch
+        {
+            StoreDeliveryClient.DeliveryStatus.Bag => "bag",
+            StoreDeliveryClient.DeliveryStatus.Mail => "mail",
+            _ => "error",
+        })
+        .ToList();
+
+    return Results.Ok(new { ok = result.Ok, cashStatus, itemStatuses });
+}).RequireRateLimiting("auth");
+
 app.Run();
 
 static string RequireEnv(string name)
@@ -253,6 +300,10 @@ static bool IsValidUsername(string? username, out string error)
 public sealed record AccountRequest(string Username, string Password);
 
 public sealed record DeliverRequest(uint CharacterSerial, string ItemCode, uint Amount);
+
+public sealed record DeliverPackageItem(string ItemCode, uint Amount);
+
+public sealed record DeliverPackageRequest(uint CharacterSerial, string AccountUsername, int CashAmount, List<DeliverPackageItem> Items);
 
 public sealed class AccountAuth
 {
