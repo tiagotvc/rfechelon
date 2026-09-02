@@ -57,12 +57,22 @@ builder.Services.AddDbContext<BridgeDbContext>(options =>
 builder.Services.AddDbContext<WorldDbContext>(options =>
     options.UseSqlServer(worldDatabaseUrl));
 
+// Esse limiter e' uma rede de seguranca contra a PROPRIA bridge broncar (loop,
+// bug, chave vazada) - NAO e' a defesa real contra brute-force de senha. O
+// motivo: todo request aqui vem do backend do site (Vercel), nunca direto do
+// navegador do jogador - um unico bucket global (era PermitLimit=10, sem
+// particionar por chamador) achatava TODO mundo junto (registro, login,
+// listar personagem, entregar pacote) e ja quebraria com poucos jogadores
+// navegando /gamecp ao mesmo tempo (cada carregamento de pagina chama
+// /v1/characters). A defesa real contra tentativa de senha em massa mora no
+// site (rate limit por IP real do visitante, ver app/lib/rate-limit.ts no
+// repo rf-ascension) - so' o site enxerga o IP de quem esta' de fato pedindo.
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
     options.AddFixedWindowLimiter("auth", limiterOptions =>
     {
-        limiterOptions.PermitLimit = 10;
+        limiterOptions.PermitLimit = 300;
         limiterOptions.Window = TimeSpan.FromMinutes(1);
         limiterOptions.QueueLimit = 0;
     });
