@@ -15,6 +15,8 @@ public static class StoreDeliveryClient
     private const byte MsgDeliverItemResponse = 2;
     private const byte MsgDeliverPackageRequest = 3;
     private const byte MsgDeliverPackageResponse = 4;
+    private const byte MsgCreditCurrencyRequest = 5;
+    private const byte MsgCreditCurrencyResponse = 6;
     private const int ItemCodeFieldLength = 16;
     private const int AccountUsernameFieldLength = 16;
 
@@ -24,6 +26,13 @@ public static class StoreDeliveryClient
         Mail = 1,
         NotFound = 2,
         Error = 3,
+    }
+
+    public enum CurrencyType : byte
+    {
+        Cash = 0,
+        Dalant = 1,
+        GoldPoint = 2,
     }
 
     public enum CashCreditStatus : byte
@@ -132,6 +141,65 @@ public static class StoreDeliveryClient
             // WorldServer fora do ar, host/porta errado, timeout — quem chama decide se tenta de novo.
             return new PackageDeliveryResult(false, CashCreditStatus.Error, []);
         }
+    }
+
+    // Troca de Game CP por moeda real (Fase 5) - opcode 5/6. characterSerial so' importa pra
+    // Dalant/GoldPoint (moeda por personagem); pra Cash (moeda por conta) o WorldServer ignora e
+    // credita direto na conta pelo accountUsername - ainda assim mandamos o serial, sem custo.
+    public static async Task<bool> CreditCurrencyAsync(
+        string host,
+        int port,
+        string secret,
+        uint characterSerial,
+        string accountUsername,
+        CurrencyType currency,
+        uint amount,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(timeout);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+            using var client = new TcpClient();
+            await client.ConnectAsync(host, port, linked.Token).ConfigureAwait(false);
+            using var stream = client.GetStream();
+
+            var payload = BuildCreditCurrencyRequest(secret, characterSerial, accountUsername, currency, amount);
+            await SendMessageAsync(stream, payload, linked.Token).ConfigureAwait(false);
+            var resp = await RecvMessageAsync(stream, linked.Token).ConfigureAwait(false);
+
+            return resp.Length >= 2 && resp[0] == MsgCreditCurrencyResponse && resp[1] == 0;
+        }
+        catch
+        {
+            // WorldServer fora do ar, host/porta errado, timeout — quem chama decide se tenta de novo.
+            return false;
+        }
+    }
+
+    private static byte[] BuildCreditCurrencyRequest(string secret, uint characterSerial, string accountUsername, CurrencyType currency, uint amount)
+    {
+        var secretBytes = Encoding.UTF8.GetBytes(secret);
+        if (secretBytes.Length > 255)
+        {
+            throw new InvalidOperationException("WORLDSERVER_DELIVERY_SECRET grande demais (máx 255 bytes).");
+        }
+
+        var accountBytes = new byte[AccountUsernameFieldLength];
+        var accountSrc = Encoding.ASCII.GetBytes(accountUsername);
+        Array.Copy(accountSrc, accountBytes, Math.Min(accountSrc.Length, AccountUsernameFieldLength));
+
+        using var ms = new MemoryStream();
+        ms.WriteByte(MsgCreditCurrencyRequest);
+        ms.WriteByte((byte)secretBytes.Length);
+        ms.Write(secretBytes);
+        ms.Write(BitConverter.GetBytes(characterSerial));
+        ms.Write(accountBytes);
+        ms.WriteByte((byte)currency);
+        ms.Write(BitConverter.GetBytes(amount));
+        return ms.ToArray();
     }
 
     private static byte[] BuildPackageRequest(string secret, uint characterSerial, string accountUsername, int cashAmount, IReadOnlyList<PackageItem> items)

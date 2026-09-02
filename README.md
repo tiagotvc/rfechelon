@@ -22,8 +22,11 @@ que já está gravado no banco.
   jogadores ativos, não por raça; adicionar isso exigiria mexer no C++ do
   WorldServer, fora de escopo deste bridge.
 - `GET /v1/characters?username=X` — lista os personagens de uma conta
-  (`tbl_base` no banco `RF_World`: serial, nome, level, raça). Só leitura,
-  nunca escreve em `tbl_base`.
+  (`tbl_base` + `tbl_supplement` no banco `RF_World`: serial, nome, level,
+  raça, dalant, goldPoint). Só leitura, nunca escreve nessas tabelas.
+- `GET /v1/cash?username=X` — saldo real de Cash (`tbl_UserStatus` na base
+  `BILLING`, mesma tabela que `g_RFAcc.CreditBalance` do WorldServer
+  escreve). Só leitura. Cash é por CONTA, não por personagem.
 - `POST /v1/deliver` — entrega de verdade (Fase 2 da loja de doações):
   `{characterSerial, itemCode, amount}`, repassa pro canal novo do
   WorldServer (`CStoreDeliveryChannel`, porta 27602 por padrão — ver
@@ -32,6 +35,11 @@ que já está gravado no banco.
   `{ok:true, status:"bag"|"mail"}` ou `{ok:false, status:"not_found"|"error"}`
   — nunca lança erro de conexão pra fora, quem chama decide se tenta de
   novo (o site já faz isso via fila `deliveries` + retry).
+- `POST /v1/exchange` — troca Game CP (site) por moeda real do jogo (Fase
+  5): `{characterSerial, accountUsername, currency: "cash"|"dalant"|
+  "goldpoint", amount}` → opcode 5/6 do `CStoreDeliveryChannel`. Dalant/
+  Gold Point exigem `characterSerial` (moeda por personagem); Cash é por
+  conta, `characterSerial` é ignorado pelo WorldServer nesse caso.
 
 Isso é o suficiente pro fluxo "criar conta no site → logar no site →
 logar no client do jogo com a mesma credencial". Não expõe nem cria nada
@@ -51,12 +59,13 @@ que o client nunca consegue usar.
 | Variável | O que é |
 |---|---|
 | `DATABASE_URL` | Connection string do SQL Server do banco `RF_User` (mesmo banco que o AccountServer usa) |
-| `WORLD_DATABASE_URL` | Connection string do SQL Server do banco `RF_World` (personagens, `tbl_base`) — mesma instância/credencial do `DATABASE_URL` na maioria dos setups, só trocando `Database=`. Usada só por `GET /v1/characters`. |
+| `WORLD_DATABASE_URL` | Connection string do SQL Server do banco `RF_World` (personagens, `tbl_base`/`tbl_supplement`) — mesma instância/credencial do `DATABASE_URL` na maioria dos setups, só trocando `Database=`. Usada por `GET /v1/characters`. |
+| `BILLING_DATABASE_URL` | Connection string do SQL Server do banco `BILLING` (`tbl_UserStatus.Cash`) — mesma instância/credencial das outras duas na maioria dos setups, só trocando `Database=`. Usada só por `GET /v1/cash` (leitura). |
 | `ARGON2_SALT_BASE64` | **O MESMO valor** configurado no AccountServer (Settings → Security → Argon2 Salt). Usado como salt do Argon2id e pra derivar a chave HMAC/AES-GCM — sem bater esse valor, senha criada aqui nunca verifica certo no AccountServer (e vice-versa). |
 | `BRIDGE_API_KEY` | Segredo compartilhado com o site. Toda chamada em `/v1/*` precisa do header `X-Bridge-Key` com esse valor — gere algo forte, ex. `openssl rand -base64 32`. |
-| `WORLDSERVER_DELIVERY_SECRET` | Segredo compartilhado com o `CStoreDeliveryChannel` do WorldServer (porta 27602) — mandado dentro de CADA pedido de `/v1/deliver`, já que esse canal concede item (diferente do canal de status, que é só leitura e sem auth). Gere com `openssl rand -base64 32`, igual o `BRIDGE_API_KEY`. |
+| `WORLDSERVER_DELIVERY_SECRET` | Segredo compartilhado com o `CStoreDeliveryChannel` do WorldServer (porta 27602) — mandado dentro de CADA pedido de `/v1/deliver`, `/v1/deliver-package` e `/v1/exchange`, já que esse canal concede item/moeda (diferente do canal de status, que é só leitura e sem auth). Gere com `openssl rand -base64 32`, igual o `BRIDGE_API_KEY`. |
 
-Sem qualquer uma dessas cinco, o processo recusa subir (falha rápido e
+Sem qualquer uma dessas seis, o processo recusa subir (falha rápido e
 explícito, não silenciosamente).
 
 Opcionais (têm valor padrão, só mudar se o WorldServer estiver em outra
@@ -71,6 +80,7 @@ máquina da mesma rede): `WORLDSERVER_STATUS_HOST` (padrão `127.0.0.1`),
 cd AccountBridge
 DATABASE_URL="Server=...;Database=RF_User;User Id=...;Password=...;TrustServerCertificate=True" \
 WORLD_DATABASE_URL="Server=...;Database=RF_World;User Id=...;Password=...;TrustServerCertificate=True" \
+BILLING_DATABASE_URL="Server=...;Database=BILLING;User Id=...;Password=...;TrustServerCertificate=True" \
 ARGON2_SALT_BASE64="<mesmo valor do AccountServer>" \
 BRIDGE_API_KEY="uma-chave-de-teste" \
 WORLDSERVER_DELIVERY_SECRET="outra-chave-de-teste" \

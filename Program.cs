@@ -37,6 +37,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 var databaseUrl = RequireEnv("DATABASE_URL");
 var worldDatabaseUrl = RequireEnv("WORLD_DATABASE_URL");
+// Base BILLING (Cash real, tbl_UserStatus) — mesma instância/credencial das outras duas na maioria
+// dos setups, só trocando o Database=. Só leitura aqui (crédito continua indo pelo WorldServer/
+// g_RFAcc.CreditBalance — isso aqui é só pra MOSTRAR o saldo real na tela, nunca escrevemos direto).
+var billingDatabaseUrl = RequireEnv("BILLING_DATABASE_URL");
 var argon2SaltBase64 = RequireEnv("ARGON2_SALT_BASE64");
 var bridgeApiKey = RequireEnv("BRIDGE_API_KEY");
 // Onde o mod side-channel do WorldServer escuta — por padrão localhost, já que este bridge roda
@@ -56,6 +60,8 @@ builder.Services.AddDbContext<BridgeDbContext>(options =>
     options.UseSqlServer(databaseUrl));
 builder.Services.AddDbContext<WorldDbContext>(options =>
     options.UseSqlServer(worldDatabaseUrl));
+builder.Services.AddDbContext<BillingDbContext>(options =>
+    options.UseSqlServer(billingDatabaseUrl));
 
 // Esse limiter e' uma rede de seguranca contra a PROPRIA bridge broncar (loop,
 // bug, chave vazada) - NAO e' a defesa real contra brute-force de senha. O
@@ -155,7 +161,10 @@ v1.MapGet("/status", async () =>
 
 // Lista os personagens de uma conta (tbl_base.Account = usuario em texto
 // puro, o mesmo digitado no login — nao precisa reverter o HMAC de
-// tbl_rfaccount). So leitura, nunca escreve em tbl_base.
+// tbl_rfaccount). So leitura, nunca escreve em tbl_base/tbl_supplement.
+// dalant/goldPoint agora tambem voltam aqui (Fase 5, aba Recarregar) —
+// join manual em vez de FK de verdade porque tbl_supplement nao tem uma
+// declarada, so' compartilha Serial com tbl_base.
 v1.MapGet("/characters", async (string? username, WorldDbContext world) =>
 {
     if (!IsValidUsername(username, out var error))
@@ -167,10 +176,82 @@ v1.MapGet("/characters", async (string? username, WorldDbContext world) =>
         .AsNoTracking()
         .Where(c => c.Account == username)
         .OrderBy(c => c.Slot)
-        .Select(c => new { serial = c.Serial, name = c.Name, level = c.Lv, race = c.Race })
+        .Select(c => new { serial = c.Serial, name = c.Name, level = c.Lv, race = c.Race, dalant = c.Dalant })
         .ToListAsync();
 
-    return Results.Ok(characters);
+    if (characters.Count == 0)
+    {
+        return Results.Ok(characters.Select(c => new { c.serial, c.name, c.level, c.race, c.dalant, goldPoint = 0 }));
+    }
+
+    var serials = characters.Select(c => c.serial).ToList();
+    var goldPoints = await world.Supplements
+        .AsNoTracking()
+        .Where(s => serials.Contains(s.Serial))
+        .ToDictionaryAsync(s => s.Serial, s => s.ActionPoint_2);
+
+    var result = characters.Select(c => new
+    {
+        c.serial,
+        c.name,
+        c.level,
+        c.race,
+        c.dalant,
+        goldPoint = goldPoints.GetValueOrDefault(c.serial, 0),
+    });
+
+    return Results.Ok(result);
+}).RequireRateLimiting("auth");
+
+// Saldo real de Cash (base BILLING, tbl_UserStatus) — so' leitura, pra mostrar na tela. Cash e' por
+// CONTA (nao por personagem), diferente de Dalant/Gold Point.
+v1.MapGet("/cash", async (string? username, BillingDbContext billing) =>
+{
+    if (!IsValidUsername(username, out var error))
+    {
+        return Results.BadRequest(new { error });
+    }
+
+    var row = await billing.UserStatus.AsNoTracking().FirstOrDefaultAsync(u => u.Id == username);
+    return Results.Ok(new { cash = row?.Cash ?? 0 });
+}).RequireRateLimiting("auth");
+
+// Troca Game CP (site) por moeda real do jogo (Fase 5) — repassa pro opcode 5/6 do
+// CStoreDeliveryChannel. Mesma regra de nunca lançar erro de conexão pra fora.
+v1.MapPost("/exchange", async (ExchangeRequest request) =>
+{
+    if (!IsValidUsername(request.AccountUsername, out var usernameError) || request.Amount == 0)
+    {
+        return Results.BadRequest(new { error = "accountUsername válido e amount > 0 são obrigatórios." });
+    }
+    var currency = request.Currency?.ToLowerInvariant();
+    if (currency != "cash" && currency != "dalant" && currency != "goldpoint")
+    {
+        return Results.BadRequest(new { error = "currency precisa ser cash, dalant ou goldpoint." });
+    }
+    if (currency != "cash" && request.CharacterSerial == 0)
+    {
+        return Results.BadRequest(new { error = "characterSerial é obrigatório pra trocar Dalant/Gold Point." });
+    }
+
+    var currencyType = currency switch
+    {
+        "cash" => StoreDeliveryClient.CurrencyType.Cash,
+        "dalant" => StoreDeliveryClient.CurrencyType.Dalant,
+        _ => StoreDeliveryClient.CurrencyType.GoldPoint,
+    };
+
+    var ok = await StoreDeliveryClient.CreditCurrencyAsync(
+        deliveryHost,
+        deliveryPort,
+        deliverySecret,
+        request.CharacterSerial,
+        request.AccountUsername,
+        currencyType,
+        request.Amount,
+        TimeSpan.FromSeconds(8));
+
+    return Results.Ok(new { ok });
 }).RequireRateLimiting("auth");
 
 // Entrega de verdade no personagem (Fase 2 da loja de doações) — repassa
@@ -315,6 +396,8 @@ public sealed record DeliverPackageItem(string ItemCode, uint Amount);
 
 public sealed record DeliverPackageRequest(uint CharacterSerial, string AccountUsername, int CashAmount, List<DeliverPackageItem> Items);
 
+public sealed record ExchangeRequest(uint CharacterSerial, string AccountUsername, string Currency, uint Amount);
+
 public sealed class AccountAuth
 {
     public byte[] IdHmac { get; set; } = [];
@@ -354,11 +437,21 @@ public sealed class CharacterRow
     public int Slot { get; set; }
     public int Race { get; set; }
     public int Lv { get; set; }
+    public int Dalant { get; set; }
+}
+
+// tbl_supplement.ActionPoint_2 = Gold Point (slots 0/1 sao Mining/Hunting Point, nao confundir —
+// ver pesquisa de reverse engineering desta sessao). So' leitura aqui, credito passa pelo WorldServer.
+public sealed class SupplementRow
+{
+    public int Serial { get; set; }
+    public int ActionPoint_2 { get; set; }
 }
 
 public sealed class WorldDbContext(DbContextOptions<WorldDbContext> options) : DbContext(options)
 {
     public DbSet<CharacterRow> Characters => Set<CharacterRow>();
+    public DbSet<SupplementRow> Supplements => Set<SupplementRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -372,6 +465,38 @@ public sealed class WorldDbContext(DbContextOptions<WorldDbContext> options) : D
             entity.Property(e => e.Slot).HasColumnName("Slot");
             entity.Property(e => e.Race).HasColumnName("Race");
             entity.Property(e => e.Lv).HasColumnName("Lv");
+            entity.Property(e => e.Dalant).HasColumnName("Dalant");
+        });
+        modelBuilder.Entity<SupplementRow>(entity =>
+        {
+            entity.ToTable("tbl_supplement", "dbo");
+            entity.HasKey(e => e.Serial);
+            entity.Property(e => e.Serial).HasColumnName("Serial");
+            entity.Property(e => e.ActionPoint_2).HasColumnName("ActionPoint_2");
+        });
+    }
+}
+
+// Base BILLING (Cash real), so' leitura. Mesma tabela que g_RFAcc.CreditBalance (WorldServer)
+// escreve — nunca escrevemos aqui, so' consultamos pra exibir o saldo real na tela.
+public sealed class UserStatusRow
+{
+    public string Id { get; set; } = "";
+    public int Cash { get; set; }
+}
+
+public sealed class BillingDbContext(DbContextOptions<BillingDbContext> options) : DbContext(options)
+{
+    public DbSet<UserStatusRow> UserStatus => Set<UserStatusRow>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<UserStatusRow>(entity =>
+        {
+            entity.ToTable("tbl_UserStatus", "dbo");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("ID");
+            entity.Property(e => e.Cash).HasColumnName("Cash");
         });
     }
 }
