@@ -101,7 +101,7 @@ var v1 = app.MapGroup("/v1").AddEndpointFilter(async (context, next) =>
 
 v1.MapPost("/accounts", async (AccountRequest request, BridgeDbContext db) =>
 {
-    if (!TryValidateCredentials(request.Username, request.Password, out var error))
+    if (!TryValidateNewCredentials(request.Username, request.Password, out var error))
     {
         return Results.BadRequest(new { error });
     }
@@ -131,7 +131,7 @@ v1.MapPost("/accounts", async (AccountRequest request, BridgeDbContext db) =>
 
 v1.MapPost("/accounts/login", async (AccountRequest request, BridgeDbContext db) =>
 {
-    if (!TryValidateCredentials(request.Username, request.Password, out var error))
+    if (!TryValidateExistingCredentials(request.Username, request.Password, out var error))
     {
         return Results.BadRequest(new { error });
     }
@@ -349,10 +349,10 @@ static bool CryptographicEquals(string a, string b)
     return bytesA.Length == bytesB.Length && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(bytesA, bytesB);
 }
 
-// Mesmo limite de 12 caracteres do protocolo do cliente do jogo — ver
-// LoginHandler.LoginAccountRequest (AccountServer). ASCII simples, sem
-// espaço, pra bater com PacketStringUtil.ToAsciiNullTerm.
-static bool TryValidateCredentials(string? username, string? password, out string error)
+// Mínimo de 4 só faz sentido pra conta NOVA (UX de cadastro) — o protocolo real do client só
+// rejeita acima de 12 chars (LoginHandler.LoginAccountRequest, AccountServer:263/268), sem mínimo
+// nenhum. Contas de GM pré-existentes têm 3 caracteres (ex.: "gm3") e são válidas de verdade.
+static bool TryValidateNewCredentials(string? username, string? password, out string error)
 {
     if (string.IsNullOrWhiteSpace(username) || username.Length < 4 || username.Length > 12 || !IsAscii(username))
     {
@@ -368,6 +368,24 @@ static bool TryValidateCredentials(string? username, string? password, out strin
     return true;
 }
 
+// Login de conta JÁ EXISTENTE — não pode exigir o mínimo de 4 (ver comentário acima), só o teto
+// real de 12 do protocolo.
+static bool TryValidateExistingCredentials(string? username, string? password, out string error)
+{
+    if (string.IsNullOrWhiteSpace(username) || username.Length > 12 || !IsAscii(username))
+    {
+        error = "Usuário inválido.";
+        return false;
+    }
+    if (string.IsNullOrWhiteSpace(password) || password.Length > 12 || !IsAscii(password))
+    {
+        error = "Senha inválida.";
+        return false;
+    }
+    error = "";
+    return true;
+}
+
 static bool IsAscii(string value)
 {
     foreach (var c in value)
@@ -377,11 +395,13 @@ static bool IsAscii(string value)
     return true;
 }
 
+// Usado pelas rotas que operam sobre uma conta JÁ EXISTENTE (characters/cash/exchange/deliver-
+// package) — mesma regra do login, sem mínimo de 4.
 static bool IsValidUsername(string? username, out string error)
 {
-    if (string.IsNullOrWhiteSpace(username) || username.Length < 4 || username.Length > 12 || !IsAscii(username))
+    if (string.IsNullOrWhiteSpace(username) || username.Length > 12 || !IsAscii(username))
     {
-        error = "Usuário deve ter de 4 a 12 caracteres (letras e números, sem espaço ou acento).";
+        error = "Usuário inválido.";
         return false;
     }
     error = "";
